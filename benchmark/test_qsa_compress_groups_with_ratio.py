@@ -22,9 +22,14 @@ import flaggems_vllm
 from . import base
 
 try:
-    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
-        qsa_compress_groups_with_ratio as vendor_qsa,
-    )
+    if flaggems_vllm.vendor_name == "hygon":
+        from vllm.models.qwen4_exp.amd.ops.qsa import (
+            qsa_compress_groups_with_ratio as vendor_qsa,
+        )
+    else:
+        from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+            qsa_compress_groups_with_ratio as vendor_qsa,
+        )
 
     _HAS_VENDOR = True
     _VENDOR_ERROR = ""

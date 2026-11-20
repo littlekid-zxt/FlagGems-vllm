@@ -24,9 +24,14 @@ from . import conftest as cfg
 pytestmark = pytest.mark.qsa_compress_groups_with_ratio
 
 try:
-    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
-        qsa_compress_groups_with_ratio as vendor_qsa,
-    )
+    if flaggems_vllm.vendor_name == "hygon":
+        from vllm.models.qwen4_exp.amd.ops.qsa import (
+            qsa_compress_groups_with_ratio as vendor_qsa,
+        )
+    else:
+        from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+            qsa_compress_groups_with_ratio as vendor_qsa,
+        )
 except ImportError:
     vendor_qsa = None
 

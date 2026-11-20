@@ -60,6 +60,9 @@ from flaggems_vllm.runtime.backend._hygon.ops.persistent_topk import (  # noqa: 
 )
 from flaggems_vllm.runtime.backend._hygon.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._hygon.ops.qsa import qwen4_store_qsa_kv_rows
+from flaggems_vllm.runtime.backend._hygon.ops.qsa_compress_groups_with_ratio import (
+    qsa_compress_groups_with_ratio,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._hygon.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._hygon.ops.scaled_int8_quant import scaled_int8_quant
@@ -91,6 +94,7 @@ __all__ = [
     "per_token_group_quant_fp8",
     "persistent_topk",
     "ple_state_scatter_",
+    "qsa_compress_groups_with_ratio",
     "qsa_prepare",
     "quantize_gdn_state_int8",
     "qwen4_compress_norm_mrope_store_groups",
