@@ -34,7 +34,6 @@ from flaggems_vllm.ops.qwen4.ple_fusion import (
 )
 from flaggems_vllm.ops.qwen4.ple_state import ple_state_gather, ple_state_scatter_
 from flaggems_vllm.ops.qwen4.qsa import (
-    qsa_compress_groups_with_ratio,
     qsa_compress_norm_mrope_store_groups,
     qsa_mqa_paged,
     qsa_store_cache_rows,
@@ -45,6 +44,9 @@ from flaggems_vllm.ops.qwen4.qsa import (
     qwen4_vendor_compress_qsa_groups,
     qwen4_vendor_qsa_mqa_paged,
     qwen4_vendor_store_qsa_rows,
+)
+from flaggems_vllm.ops.qwen4.qsa_compress_groups_with_ratio import (
+    qsa_compress_groups_with_ratio,
 )
 from flaggems_vllm.ops.qwen4.qsa_prepare import qsa_prepare
 from flaggems_vllm.ops.qwen4.qsa_sparse_paged_attention import (

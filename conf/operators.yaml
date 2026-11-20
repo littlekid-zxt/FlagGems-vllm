@@ -2080,6 +2080,19 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '0.3'
+- id: qsa_compress_groups_with_ratio
+  description: 'Pools QSA raw-key groups across the compressor-state ring and current
+
+    token rows, returning compressed keys and their packed first positions.'
+  for:
+  - vllm.models.qwen4_exp.nvidia.ops.qsa.qsa_compress_groups_with_ratio
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: qsa_prepare
   description: 'Horizontally-fused Qwen4Exp QSA prepare: Gemma RMSNorm and MRoPE for
     the
