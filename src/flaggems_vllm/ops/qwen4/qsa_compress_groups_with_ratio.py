@@ -245,9 +245,9 @@ def qsa_compress_groups_with_ratio(
             "QSA compression requires same-device accelerator Triton tensors"
         )
     rows = token_to_req.numel()
-    if raw_keys.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+    if raw_keys.dtype != torch.bfloat16:
         raise NotImplementedError(
-            f"QSA compression supports BF16 and FP8 E4M3FN, got {raw_keys.dtype}"
+            f"QSA compression supports BF16 only, got {raw_keys.dtype}"
         )
     if compress_ratio <= 0:
         raise ValueError("QSA compression ratio must be positive")

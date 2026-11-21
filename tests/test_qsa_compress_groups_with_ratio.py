@@ -28,6 +28,10 @@ try:
         from vllm.models.qwen4_exp.amd.ops.qsa import (
             qsa_compress_groups_with_ratio as vendor_qsa,
         )
+    elif flaggems_vllm.vendor_name == "ascend":
+        from vllm_ascend.ops.triton.qwen4_exp.qsa import (
+            qsa_compress_groups_with_ratio as vendor_qsa,
+        )
     else:
         from vllm.models.qwen4_exp.nvidia.ops.qsa import (
             qsa_compress_groups_with_ratio as vendor_qsa,
@@ -42,7 +46,7 @@ _HAS_DEVICE = _device_module is not None and _device_module.is_available()
 if not _HAS_DEVICE:
     _HAS_DEVICE = bool(flaggems_vllm.runtime.torch_device_fn.device_count())
 
-DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
+DTYPES = (torch.bfloat16,)
 
 
 @dataclass(frozen=True)
@@ -134,8 +138,8 @@ def make_scenario_inputs(scenario, dtype, seed=20261119):
         scenario.head_dim,
         generator=generator,
         device=device,
-        dtype=torch.bfloat16,
-    ).to(dtype)
+        dtype=dtype,
+    )
     state_cache = torch.randn(
         scenario.state_blocks,
         scenario.state_size,
@@ -143,8 +147,8 @@ def make_scenario_inputs(scenario, dtype, seed=20261119):
         scenario.head_dim,
         generator=generator,
         device=device,
-        dtype=torch.bfloat16,
-    ).to(dtype)
+        dtype=dtype,
+    )
     if rows:
         logical_positions = torch.cat(
             [

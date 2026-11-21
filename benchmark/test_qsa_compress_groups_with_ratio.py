@@ -26,6 +26,10 @@ try:
         from vllm.models.qwen4_exp.amd.ops.qsa import (
             qsa_compress_groups_with_ratio as vendor_qsa,
         )
+    elif flaggems_vllm.vendor_name == "ascend":
+        from vllm_ascend.ops.triton.qwen4_exp.qsa import (
+            qsa_compress_groups_with_ratio as vendor_qsa,
+        )
     else:
         from vllm.models.qwen4_exp.nvidia.ops.qsa import (
             qsa_compress_groups_with_ratio as vendor_qsa,
@@ -130,8 +134,8 @@ def make_inputs(scenario, dtype, device, seed=20261119):
         scenario.head_dim,
         generator=generator,
         device=device,
-        dtype=torch.bfloat16,
-    ).to(dtype)
+        dtype=dtype,
+    )
     state_cache = torch.randn(
         scenario.state_blocks,
         scenario.state_size,
@@ -139,8 +143,8 @@ def make_inputs(scenario, dtype, device, seed=20261119):
         scenario.head_dim,
         generator=generator,
         device=device,
-        dtype=torch.bfloat16,
-    ).to(dtype)
+        dtype=dtype,
+    )
     logical_positions = torch.cat(
         [
             torch.arange(
@@ -224,21 +228,6 @@ def test_qsa_compress_groups_with_ratio_perf_bf16():
         op_name="qsa_compress_groups_with_ratio",
         torch_op=vendor_qsa,
         dtypes=[torch.bfloat16],
-    )
-    bench.set_gems(flaggems_vllm.qsa_compress_groups_with_ratio)
-    bench.run()
-
-
-@pytest.mark.qsa_compress_groups_with_ratio
-@pytest.mark.skipif(
-    not _HAS_VENDOR,
-    reason=f"requires the vLLM baseline: {_VENDOR_ERROR}".rstrip(": "),
-)
-def test_qsa_compress_groups_with_ratio_perf_fp8():
-    bench = QsaCompressGroupsWithRatioBenchmark(
-        op_name="qsa_compress_groups_with_ratio",
-        torch_op=vendor_qsa,
-        dtypes=[torch.float8_e4m3fn],
     )
     bench.set_gems(flaggems_vllm.qsa_compress_groups_with_ratio)
     bench.run()
