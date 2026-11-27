@@ -2110,7 +2110,7 @@ def _fused_experts_impl(
 ) -> torch.Tensor:
     if (
         hidden_states.dtype in (torch.bfloat16, torch.float16)
-        and 4096 <= hidden_states.size(0) < 8192
+        and hidden_states.size(0) >= 4096
         and w1.size(1) >= 512
         and w1.size(1) % 128 == 0
         and hidden_states.size(1) % 64 == 0
