@@ -14,6 +14,7 @@
 
 import functools
 import logging
+import os
 from enum import Enum
 from typing import Any, Optional
 
@@ -2184,6 +2185,13 @@ def _fused_experts_impl(
             # silu measured +1.4~1.6% (3-round stable) vs fused PAIR;
             # vLLM's narrower dot partitioning wins at this scale.
             do_fuse_silu = False
+        fuse_silu_override = os.environ.get("FLAGGEMS_HYGON_MOE_FUSE_SILU")
+        if fuse_silu_override is not None:
+            do_fuse_silu = (
+                can_use_fused_silu
+                and is_plain_half_config
+                and fuse_silu_override == "1"
+            )
         use_half_gemm_fast_paths = not is_embedded_config and is_plain_half_config
 
         gemm1_config = base_config
