@@ -3086,6 +3086,25 @@ def _compact_padded_kernel(
 
 
 @triton.jit
+def _compact_scatter_kernel(
+    src_ptr,
+    dst_ptr,
+    inv_perm_ptr,
+    hidden,
+    TOPK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    token = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    cols = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    col_mask = cols < hidden
+    x = tl.load(src_ptr + token * hidden + cols, mask=col_mask, other=0.0)
+    for j in tl.static_range(TOPK):
+        pos = tl.load(inv_perm_ptr + token * TOPK + j)
+        tl.store(dst_ptr + pos * hidden + cols, x, mask=col_mask)
+
+
+@triton.jit
 def _grouped_gemm_kernel(
     a_ptr,
     b_ptr,
@@ -3296,7 +3315,7 @@ def _dense_get_buffers(M, E, H, n_inter, topk, device, dtype, max_tokens):
     row_token = torch.empty(max_tokens, dtype=torch.int32, device=device)
     inv_perm = torch.empty(M * topk, dtype=torch.int32, device=device)
     m_indices = torch.empty(max_tokens, dtype=torch.int32, device=device)
-    hidden_perm = torch.empty(max_tokens, H, dtype=dtype, device=device)
+    hidden_perm = torch.zeros(max_tokens, H, dtype=dtype, device=device)
     gate_up = torch.empty(max_tokens, 2 * n_inter, dtype=dtype, device=device)
     act = torch.empty(max_tokens, n_inter, dtype=dtype, device=device)
     # GEMM2 output: cached like the rest so a repeated call does not allocate
@@ -3372,13 +3391,12 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         topk=topk,
         BLOCK=1024,
     )
-    _compact_padded_kernel[(triton.cdiv(total, 8), triton.cdiv(H, 256))](
+    _compact_scatter_kernel[(M, triton.cdiv(H, 256))](
         hidden_states,
         hidden_perm,
-        row_token,
-        total,
+        inv_perm,
         H,
-        BLOCK_M=8,
+        TOPK=topk,
         BLOCK_H=256,
         num_warps=4,
     )
@@ -3389,8 +3407,7 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         # partition, so its warp count comes from the launch, not from
         # worker_num_warps. A 128x256 tile at 8 warps keeps the accumulator at
         # 128 registers per thread and is ~1.3x faster than 128x128 at 4 warps;
-        # it needs N % 256 == 0, and 3 stages already use 144 of the 192 KiB
-        # of shared memory.
+        # it needs N % 256 == 0, and four stages fill the 192 KiB shared memory.
         # Keep the wide tile on the N range it is verified for; a Mixtral-like
         # shard (E=8, N=28672) has not been re-checked since the LLC miscompile
         # above was found, so N > 4096 stays on the narrow tile for now.
@@ -3404,7 +3421,7 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
             total,
             2 * n_inter,
             H,
-            STAGES=3,
+            STAGES=4 if wide else 3,
             BN=256 if wide else 128,
             NUM_WARPS=8 if wide else 4,
         )
@@ -3437,9 +3454,8 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
     # GEMM1, and reusing it here triggers an IMA on MUSA/Triton. It writes to
     # the cached mm2 buffer instead.
     if use_tle:
-        # GEMM2 gets the same treatment: a 128x256 tile keeps the accumulator at
-        # 128 registers per thread once the consumer has 8 warps, and the K-loop
-        # is short (K = intermediate size), so two stages suffice.
+        # GEMM2 uses a short K loop and two stages. Its 128x256 tile keeps the
+        # accumulator at 64 registers per thread with 16 warps.
         wide2 = H % 256 == 0
         _tle_gemm(
             act,
@@ -3452,7 +3468,7 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
             n_inter,
             STAGES=2,
             BN=256 if wide2 else 128,
-            NUM_WARPS=8 if wide2 else 4,
+            NUM_WARPS=16 if wide2 else 4,
         )
     else:
         w2t = _dense_transpose_weights(w2)

@@ -81,6 +81,8 @@ def _get_supported_dtypes():
     if VENDOR == "thead":
         # The PPU DeepGEMM expert path only accepts bfloat16 weights.
         return [torch.bfloat16]
+    if VENDOR == "mthreads":
+        return [torch.bfloat16]
     return [torch.bfloat16, torch.float16]
 
 
