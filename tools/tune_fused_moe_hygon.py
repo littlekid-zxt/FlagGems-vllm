@@ -32,9 +32,11 @@ SHAPES = {
         (64, 8, 4096, 14336, 2),
     ],
     "deepseek": [
+        (1, 256, 7168, 2048, 8),
         (4, 256, 7168, 2048, 8),
         (16, 256, 7168, 2048, 8),
         (64, 256, 7168, 2048, 8),
+        (256, 256, 7168, 2048, 8),
     ],
 }
 
@@ -122,6 +124,40 @@ EXTENDED_VARIANTS = CORE_VARIANTS + [
 ]
 
 
+def tile(bm=16, bn=128, bk=64, warps=4, stages=2):
+    return {
+        "BLOCK_SIZE_M": bm,
+        "BLOCK_SIZE_N": bn,
+        "BLOCK_SIZE_K": bk,
+        "GROUP_SIZE_M": 1,
+        "num_warps": warps,
+        "num_stages": stages,
+    }
+
+
+FOCUSED_VARIANTS = [
+    CORE_VARIANTS[0],
+    CORE_VARIANTS[3],
+    ("unfused_bk128_s1", "0", tile(bk=128, stages=1)),
+    ("unfused_bk128_s2", "0", tile(bk=128)),
+    ("unfused_bn64_bk128", "0", tile(bn=64, bk=128)),
+    ("unfused_bk64_w8", "0", tile(warps=8)),
+    ("unfused_bk64_s3", "0", tile(stages=3)),
+    ("unfused_bn256_bk32_w8", "0", tile(bn=256, bk=32, warps=8)),
+    ("unfused_bm32_bn64_bk64", "0", tile(bm=32, bn=64)),
+    (
+        "unfused_g1_bk128_s1",
+        "0",
+        {**tile(), "gemm1": {"BLOCK_SIZE_K": 128, "num_stages": 1}},
+    ),
+    (
+        "unfused_g2_bk128_s1",
+        "0",
+        {**tile(), "gemm2": {"BLOCK_SIZE_K": 128, "num_stages": 1}},
+    ),
+]
+
+
 def measure(fn, warmup, rep):
     return triton.testing.do_bench(
         fn,
@@ -139,7 +175,11 @@ def main():
         choices=sorted(SHAPES),
         default=list(SHAPES),
     )
-    parser.add_argument("--variant-set", choices=("core", "extended"), default="core")
+    parser.add_argument(
+        "--variant-set",
+        choices=("core", "extended", "focused"),
+        default="core",
+    )
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--rep", type=int, default=100)
@@ -151,7 +191,12 @@ def main():
 
     if flaggems_vllm.vendor_name != "hygon":
         raise RuntimeError("this tuner requires the Hygon backend")
-    variants = CORE_VARIANTS if args.variant_set == "core" else EXTENDED_VARIANTS
+    variant_sets = {
+        "core": CORE_VARIANTS,
+        "extended": EXTENDED_VARIANTS,
+        "focused": FOCUSED_VARIANTS,
+    }
+    variants = variant_sets[args.variant_set]
     original_get_config = moe_impl.try_get_optimal_moe_config
     results = []
     output = Path(args.output)
@@ -182,8 +227,19 @@ def main():
                             value = original_get_config(*fn_args, **fn_kwargs)
                             is_tuple = isinstance(value, tuple)
                             config, embedded = value if is_tuple else (value, None)
+                            stage = fn_kwargs.get(
+                                "gemm_stage",
+                                fn_args[7] if len(fn_args) > 7 else "gemm1",
+                            )
                             tuned = dict(config)
-                            tuned.update(overrides)
+                            tuned.update(
+                                {
+                                    key: value
+                                    for key, value in overrides.items()
+                                    if key not in ("gemm1", "gemm2")
+                                }
+                            )
+                            tuned.update(overrides.get(stage, {}))
                             return (tuned, embedded) if is_tuple else tuned
 
                         moe_impl.try_get_optimal_moe_config = get_config_with_overrides
