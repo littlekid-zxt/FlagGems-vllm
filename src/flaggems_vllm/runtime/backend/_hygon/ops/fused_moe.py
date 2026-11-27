@@ -14,7 +14,6 @@
 
 import functools
 import logging
-import os
 from enum import Enum
 from typing import Any, Optional
 
@@ -108,6 +107,18 @@ _HALF_GEMM_TILE_M = 128
 _HALF_GEMM_TILE_K = 64
 _HALF_GEMM2_TILE_N = 256
 _PLAIN_HALF_CONFIG_DTYPES = ("fp16", "bf16")
+
+
+def _use_small_m_w16a16_tuning(M, E, N, K, topk, dtype, gemm_stage):
+    if dtype not in _PLAIN_HALF_CONFIG_DTYPES:
+        return False
+    if M <= 64:
+        return True
+    if M != 256 or E != 256 or topk != 8:
+        return False
+    if gemm_stage == "gemm1":
+        return N == 4096 and K == 7168
+    return N == 7168 and K == 2048
 
 
 @functools.lru_cache(maxsize=1)
@@ -641,6 +652,20 @@ def get_default_config(
             config["num_warps"] = 8
         if M <= 4096:
             config["num_stages"] = 2
+
+    if _use_small_m_w16a16_tuning(M, E, N, K, topk, dtype, gemm_stage):
+        # Small routed tiles favor the narrower N tile and fewer K iterations.
+        config.update(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 2,
+            }
+        )
+        config.pop("PAIR_GATE_UP_DOT", None)
 
     return config
 
@@ -2175,7 +2200,12 @@ def _fused_experts_impl(
         # Fused SiLU only for plain half configs: FP8/INT8 fused GEMM1
         # halves N_out (single-pass 2N) which halves the grid and starves
         # the GPU at small M (measured 1.85x slower vs vLLM's unfused).
-        do_fuse_silu = can_use_fused_silu and is_plain_half_config
+        use_small_m_tuning = _use_small_m_w16a16_tuning(
+            tokens_in_chunk, E, N, K, top_k_num, config_dtype, "gemm1"
+        )
+        do_fuse_silu = (
+            can_use_fused_silu and is_plain_half_config and not use_small_m_tuning
+        )
         if is_plain_half_config and (
             (tokens_in_chunk <= 2 and (N <= 512 or tokens_in_chunk == 2))
             or (tokens_in_chunk == 16 and N <= 512)
@@ -2185,13 +2215,6 @@ def _fused_experts_impl(
             # silu measured +1.4~1.6% (3-round stable) vs fused PAIR;
             # vLLM's narrower dot partitioning wins at this scale.
             do_fuse_silu = False
-        fuse_silu_override = os.environ.get("FLAGGEMS_HYGON_MOE_FUSE_SILU")
-        if fuse_silu_override is not None:
-            do_fuse_silu = (
-                can_use_fused_silu
-                and is_plain_half_config
-                and fuse_silu_override == "1"
-            )
         use_half_gemm_fast_paths = not is_embedded_config and is_plain_half_config
 
         gemm1_config = base_config
