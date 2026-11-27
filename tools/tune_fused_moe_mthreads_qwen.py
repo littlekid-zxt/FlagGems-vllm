@@ -14,15 +14,18 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-import torch
-import torch_musa
-import triton
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import flaggems_vllm
-import flaggems_vllm.runtime.backend._mthreads.ops.fused_moe as moe_impl
-from benchmark.test_fused_moe import _input_fn, mthreads_fused_moe_op
+import torch  # noqa: E402
+import torch_musa  # noqa: E402
+import triton  # noqa: E402
+
+import flaggems_vllm  # noqa: E402
+import flaggems_vllm.runtime.backend._mthreads.ops.fused_moe as moe_impl  # noqa: E402
+from benchmark.test_fused_moe import _input_fn, mthreads_fused_moe_op  # noqa: E402
 
 
 SHAPES = {
