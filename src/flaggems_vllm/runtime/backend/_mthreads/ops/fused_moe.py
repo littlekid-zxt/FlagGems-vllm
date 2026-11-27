@@ -3341,9 +3341,9 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
     M, H = hidden_states.shape
     E, N, K = w1.shape
     n_inter = N // 2
-    if n_inter < 256 or N % 128 or H % 64 or n_inter % 64:
+    if n_inter < 128 or N % 128 or H % 64 or n_inter % 64:
         raise NotImplementedError(
-            "dense grouped MoE requires n_inter>=256 and 64/128 alignment"
+            "dense grouped MoE requires n_inter>=128 and 64/128 alignment"
         )
     topk = topk_ids.size(1)
     numel = M * topk
