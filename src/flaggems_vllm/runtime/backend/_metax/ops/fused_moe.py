@@ -95,6 +95,7 @@ def _metax_pair_fused_moe_kernel(
     DIRECT_SUM: tl.constexpr,
     OUT_TOP_K: tl.constexpr,
     FUSE_SILU: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr = False,
 ):
     """MC550 plain-half GEMM1 kernel for paired gate/up projection."""
     pid = tl.program_id(axis=0)
@@ -153,7 +154,9 @@ def _metax_pair_fused_moe_kernel(
         + offs_pair_bn[None, :] * stride_bn
     )
     pair_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N * 2), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in tl.range(
+        0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPECIALIZE
+    ):
         if K_DIVISIBLE_BY_BLOCK_K:
             a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
             if N_DIVISIBLE_BY_BLOCK_N:
@@ -400,6 +403,88 @@ def _qwenvl_tp2_config(M: int, gemm_stage: str) -> dict[str, Any]:
     }
 
 
+def _apply_metax_measured_config(
+    config: dict[str, Any],
+    M: int,
+    E: int,
+    N: int,
+    K: int,
+    topk: int,
+    dtype: str | None,
+) -> dict[str, Any]:
+    # Pure-Triton stage configs measured on MC550 in November 2026.
+    selection = None
+    if dtype == "bf16":
+        if (
+            E == 8
+            and topk == 2
+            and (N, K) in ((28672, 4096), (4096, 14336))
+        ):
+            if 2 <= M <= 16:
+                selection = (16, 64, 64, 4, 1)
+            elif 64 <= M <= 128:
+                selection = (64, 64, 64, 4, 2)
+            elif 256 <= M < 512:
+                selection = (128, 128, 64, 8, 2)
+            elif M == 512:
+                if (N, K) == (28672, 4096):
+                    selection = (64, 64, 64, 4, 2)
+                else:
+                    selection = (64, 128, 64, 8, 2)
+        elif E == 256 and topk == 8:
+            if (N, K) in ((4096, 7168), (7168, 2048)):
+                if M == 1 or 16 <= M <= 64:
+                    selection = (16, 64, 64, 4, 1)
+                elif M == 4 or M == 256:
+                    selection = (32, 64, 64, 4, 1)
+            elif (N, K) in (
+                (256, 2048),
+                (2048, 128),
+                (1024, 2048),
+                (2048, 512),
+            ):
+                if 1025 <= M <= 2048:
+                    selection = (64, 64, 64, 4, 2)
+                elif (N, K) in ((256, 2048), (2048, 128)):
+                    if M == 4435:
+                        if (N, K) == (256, 2048):
+                            selection = (128, 64, 64, 4, 2)
+                        else:
+                            selection = (128, 256, 32, 8, 2)
+                    elif M == 4108:
+                        if (N, K) == (256, 2048):
+                            selection = (128, 64, 64, 4, 2)
+                        else:
+                            selection = (128, 128, 128, 8, 1)
+                    elif 4097 <= M <= 8191:
+                        selection = (64, 64, 64, 4, 2)
+                elif M == 4108:
+                    selection = (
+                        128,
+                        config["BLOCK_SIZE_N"],
+                        config["BLOCK_SIZE_K"],
+                        config["num_warps"],
+                        config["num_stages"],
+                    )
+            elif (N, K) in ((8192, 4096), (4096, 4096)):
+                if M == 1:
+                    selection = (32, 64, 64, 4, 1)
+                elif M == 8192:
+                    selection = (128, 128, 64, 8, 2)
+
+    if selection is not None:
+        block_m, block_n, block_k, num_warps, num_stages = selection
+        config.update(
+            BLOCK_SIZE_M=block_m,
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
+            GROUP_SIZE_M=1,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    return config
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -428,7 +513,7 @@ def get_default_config(
         return _qwen_tp2_config(M, gemm_stage, enable_gemm_fast_path)
 
     if not _is_qwen_moe_shape(E, N, K, topk, dtype, gemm_stage):
-        return _generic_get_default_config(
+        config = _generic_get_default_config(
             M,
             E,
             N,
@@ -439,6 +524,7 @@ def get_default_config(
             gemm_stage,
             enable_gemm_fast_path,
         )
+        return _apply_metax_measured_config(config, M, E, N, K, topk, dtype)
 
     if M <= 1024:
         block_m, block_n, block_k = 16, 128, 64
@@ -637,7 +723,7 @@ def get_default_config(
             config["num_stages"] = 2
             config["SWAP_AB"] = True
 
-    return config
+    return _apply_metax_measured_config(config, M, E, N, K, topk, dtype)
 
 
 def _is_qwen_plain_half_shape(hidden_states, w1, w2, topk_ids) -> bool:
@@ -658,7 +744,7 @@ def _should_defer_router_weight(
     w1, num_tokens, apply_router_weight_on_input, is_qwen_half
 ) -> bool:
     """MC550 range selector for the backend-only fused GEMM2+reduction path."""
-    if not is_qwen_half or apply_router_weight_on_input:
+    if not is_qwen_half or apply_router_weight_on_input or w1.dtype == torch.float16:
         return False
     w1_shape = tuple(w1.shape)
     if w1_shape == (512, 2048, 4096):
@@ -1689,6 +1775,136 @@ def fused_moe_kernel_gptq_awq(
 
 
 @triton.jit
+def _metax_persistent_fused_moe_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_bias_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_asm,
+    stride_ask,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    stride_bbe,
+    stride_bbn,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    naive_block_assignment: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    use_fp8_w8a8: tl.constexpr,
+    use_int8_w8a8: tl.constexpr,
+    use_int8_w8a16: tl.constexpr,
+    per_channel_quant: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    SWAP_AB: tl.constexpr,
+    K_DIVISIBLE_BY_BLOCK_K: tl.constexpr,
+    N_DIVISIBLE_BY_BLOCK_N: tl.constexpr,
+    PAIR_GATE_UP_DOT: tl.constexpr,
+    DIRECT_SUM: tl.constexpr,
+    OUT_TOP_K: tl.constexpr,
+    FUSE_SILU: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr = False,
+):
+    pid = tl.program_id(axis=0)
+    num_programs = tl.num_programs(axis=0)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    num_tiles = num_pid_m * num_pid_n
+    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    for tile_id in range(pid, num_tiles, num_programs):
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // group_size_m
+
+        offs_token = tl.load(sorted_token_ids_ptr + pid_m * BLOCK_SIZE_M + offs)
+        offs_token = offs_token.to(tl.int64)
+        token_mask = offs_token < num_valid_tokens
+        off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+        valid_expert = off_experts != -1
+        off_experts = tl.maximum(off_experts, 0)
+        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        if not N_DIVISIBLE_BY_BLOCK_N:
+            offs_bn = offs_bn % N
+
+        a_ptrs = (
+            a_ptr
+            + (offs_token[:, None] // top_k * stride_am)
+            + offs_k[None, :] * stride_ak
+        )
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + offs_k[:, None] * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            if K_DIVISIBLE_BY_BLOCK_K:
+                a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+                b = tl.load(b_ptrs, mask=valid_expert, other=0.0)
+            else:
+                k_remaining = K - k * BLOCK_SIZE_K
+                a = tl.load(
+                    a_ptrs,
+                    mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+                    other=0.0,
+                )
+                b = tl.load(
+                    b_ptrs,
+                    mask=(offs_k[:, None] < k_remaining) & valid_expert,
+                    other=0.0,
+                )
+            accumulator += tl.dot(a, b)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+        if MUL_ROUTED_WEIGHT:
+            moe_weight = tl.load(
+                topk_weights_ptr + offs_token, mask=token_mask, other=0
+            )
+            accumulator *= moe_weight[:, None]
+
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None]
+        if not N_DIVISIBLE_BY_BLOCK_N:
+            c_mask = c_mask & (offs_cn[None, :] < N)
+        if valid_expert == 0:
+            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        tl.store(c_ptrs, accumulator.to(compute_type), mask=c_mask)
+
+
+@triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
@@ -1745,6 +1961,7 @@ def fused_moe_kernel(
     DIRECT_SUM: tl.constexpr,
     OUT_TOP_K: tl.constexpr,
     FUSE_SILU: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr = False,
 ):
     """Fused MoE kernel: token × expert GEMM with quantization support and optional SiLU fusion."""
     # Map pid to C block (grouped ordering for L2 reuse)
@@ -1815,7 +2032,9 @@ def fused_moe_kernel(
             + (offs_k[:, None] * stride_bk + offs_pair_bn[None, :] * stride_bn)
         )
         pair_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N * 2), dtype=tl.float32)
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        for k in tl.range(
+            0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPECIALIZE
+        ):
             if K_DIVISIBLE_BY_BLOCK_K:
                 a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
                 if N_DIVISIBLE_BY_BLOCK_N:
@@ -2333,27 +2552,56 @@ def invoke_fused_moe_triton_kernel(
 
     #  FUSE_SILU means B.size(1) contains both Gate and Up. N is halved.
     actual_N = B.size(1) // 2 if FUSE_SILU else B.size(1)
-    grid = lambda META: (
-        triton.cdiv(EM, META["BLOCK_SIZE_M"])
-        * triton.cdiv(actual_N, META["BLOCK_SIZE_N"]),
-    )
+    persistent = config.get("PERSISTENT_GEMM", False)
     HAS_BIAS = B_bias is not None
+    if persistent and (
+        FUSE_SILU
+        or direct_sum
+        or sorted_token_ids is None
+        or HAS_BIAS
+        or use_fp8_w8a8
+        or use_int8_w8a8
+        or use_int8_w8a16
+        or use_int4_w4a16
+    ):
+        raise NotImplementedError(
+            "PERSISTENT_GEMM supports plain-half GEMM2 with sorted tokens only"
+        )
+    if persistent:
+        num_sms = torch.cuda.get_device_properties(A.device).multi_processor_count
+        grid = lambda META: (
+            min(
+                triton.cdiv(EM, META["BLOCK_SIZE_M"])
+                * triton.cdiv(actual_N, META["BLOCK_SIZE_N"]),
+                num_sms,
+            ),
+        )
+    else:
+        grid = lambda META: (
+            triton.cdiv(EM, META["BLOCK_SIZE_M"])
+            * triton.cdiv(actual_N, META["BLOCK_SIZE_N"]),
+        )
 
     config = config.copy()
     config["SPLIT_K"] = 1
+    config.pop("PERSISTENT_GEMM", False)
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
     if block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
 
     swap_AB = config.pop("SWAP_AB", False)
     pair_gate_up_dot = config.pop("PAIR_GATE_UP_DOT", False)
+    config["WARP_SPECIALIZE"] = config.get("WARP_SPECIALIZE", False)
     # Force disable SWAP_AB in fusion mode
     if FUSE_SILU:
         swap_AB = False
 
-    _selected_kernel = (
-        _metax_pair_fused_moe_kernel if pair_gate_up_dot else fused_moe_kernel
-    )
+    if persistent:
+        _selected_kernel = _metax_persistent_fused_moe_kernel
+    else:
+        _selected_kernel = (
+            _metax_pair_fused_moe_kernel if pair_gate_up_dot else fused_moe_kernel
+        )
     _selected_kernel[grid](
         A,
         B,
@@ -2570,6 +2818,39 @@ def _fused_experts_impl(
         global_num_experts = E
     top_k_num = topk_ids.size(1)
 
+    native_module = None
+    if (
+        is_qwen_half
+        and hidden_states.dtype == torch.bfloat16
+        and E == 256
+        and N in (256, 1024)
+        and K == 2048
+        and top_k_num == 8
+        and activation_enum == MoEActivation.SILU
+        and not apply_router_weight_on_input
+        and expert_map is None
+        and w1_bias is None
+        and w2_bias is None
+        and not use_fp8_w8a8
+        and not use_int8_w8a8
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and ocp_mx_scheme is None
+        and w1.is_contiguous()
+        and w2.is_contiguous()
+        and topk_weights.is_contiguous()
+    ):
+        from flaggems_vllm.runtime.backend._metax.ops import (
+            qwen_bf16_moe_native as native_module,
+        )
+
+    native_plan = {
+        "gemm1": False,
+        "gemm2": False,
+        "gemm1_grid": 1,
+        "gemm2_grid": 1,
+    }
+
     # vLLM's modular MoE aliases the output onto workspace13 (cache2 here) and
     # documents "there is only one chunk", so don't chunk: a later chunk's
     # activation would overwrite finished output rows with no error.
@@ -2735,6 +3016,19 @@ def _fused_experts_impl(
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
             base_config, is_embedded_config = get_moe_config(tokens_in_chunk)
 
+        native_plan = {
+            "gemm1": False,
+            "gemm2": False,
+            "gemm1_grid": 1,
+            "gemm2_grid": 1,
+        }
+        if native_module is not None and not is_embedded_config:
+            native_plan = native_module.get_plan(tokens_in_chunk, w2.size(2))
+        native_any = native_plan["gemm1"] or native_plan["gemm2"]
+        if native_any:
+            base_config = dict(base_config)
+            base_config["BLOCK_SIZE_M"] = 128
+
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
         qcurr_hidden_states, a1q_scale = moe_kernel_quantize_input(
@@ -2748,7 +3042,8 @@ def _fused_experts_impl(
 
         SPARSITY_FACTOR = 4
         naive_block_assignment = (
-            expert_map is None
+            not native_any
+            and expert_map is None
             and tokens_in_chunk * top_k_num * SPARSITY_FACTOR <= global_num_experts
             and not (
                 (use_int8_w8a16 or use_int4_w4a16)
@@ -2777,7 +3072,11 @@ def _fused_experts_impl(
             sorted_token_ids = None
 
         # 1. Extract a unified boolean flag for GEMM1 fusion and select config
-        do_fuse_silu = can_use_fused_silu and not naive_block_assignment
+        do_fuse_silu = (
+            can_use_fused_silu
+            and not naive_block_assignment
+            and not native_plan["gemm1"]
+        )
         use_half_gemm_fast_paths = not is_embedded_config and is_plain_half_config
 
         gemm1_config = base_config
@@ -2787,6 +3086,10 @@ def _fused_experts_impl(
                 gemm_stage="gemm1",
                 enable_gemm_fast_path=True,
             )
+            if native_any:
+                gemm1_config = dict(gemm1_config)
+                gemm1_config["BLOCK_SIZE_M"] = 128
+                gemm1_config["num_stages"] = min(gemm1_config["num_stages"], 2)
             # A tuned config may ask to give the fusion back to widen BK.
             if gemm1_config.pop("UNFUSE_SILU", False):
                 do_fuse_silu = False
@@ -2816,30 +3119,43 @@ def _fused_experts_impl(
             weights_arg = curr_topk_weights
 
         # 3. Unified GEMM1 dispatch call to eliminate redundant code blocks
-        dispatch_fused_moe_kernel(
-            qcurr_hidden_states,
-            w1,
-            out_cache,  # Dynamically assigned output buffer
-            a1q_scale,
-            w1_scale,
-            w1_zp,
-            weights_arg,  # Dynamically assigned weights argument
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            apply_router_weight_on_input,
-            top_k_num,
-            gemm1_config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-            B_bias=w1_bias,
-            FUSE_SILU=do_fuse_silu,  # Master switch for the kernel
-        )
+        if native_plan["gemm1"]:
+            native_module.launch(
+                qcurr_hidden_states,
+                w1,
+                out_cache,
+                weights_arg,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                top_k_num,
+                native_plan["gemm1_grid"],
+            )
+        else:
+            dispatch_fused_moe_kernel(
+                qcurr_hidden_states,
+                w1,
+                out_cache,  # Dynamically assigned output buffer
+                a1q_scale,
+                w1_scale,
+                w1_zp,
+                weights_arg,  # Dynamically assigned weights argument
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                apply_router_weight_on_input,
+                top_k_num,
+                gemm1_config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                per_channel_quant=per_channel_quant,
+                block_shape=block_shape,
+                B_bias=w1_bias,
+                FUSE_SILU=do_fuse_silu,  # Master switch for the kernel
+            )
 
         # 4. Apply activation separately if the fused path was not taken
         if not do_fuse_silu:
@@ -2868,8 +3184,16 @@ def _fused_experts_impl(
                 gemm_stage="gemm2",
                 enable_gemm_fast_path=True,
             )
+        if native_any:
+            gemm2_config = dict(gemm2_config)
+            gemm2_config["BLOCK_SIZE_M"] = 128
+            gemm2_config["num_stages"] = min(gemm2_config["num_stages"], 2)
+        defer_router_weight_for_sum = (
+            defer_router_weight and not native_plan["gemm2"]
+        )
         use_direct_sum = (
-            not is_embedded_config
+            not native_plan["gemm2"]
+            and not is_embedded_config
             and direct_sum_supported
             and tokens_in_chunk >= MOE_DIRECT_SUM_MIN_TOKENS
             and expert_map is None
@@ -2886,39 +3210,52 @@ def _fused_experts_impl(
             gemm2_output = intermediate_cache3
 
         # 7. Dispatch GEMM2
-        dispatch_fused_moe_kernel(
-            qintermediate_cache2,
-            w2,
-            gemm2_output,
-            a2q_scale,
-            w2_scale,
-            w2_zp,
-            curr_topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            not apply_router_weight_on_input and not defer_router_weight,
-            1,
-            gemm2_config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-            B_bias=w2_bias,
-            FUSE_SILU=False,
-            direct_sum=use_direct_sum,
-            out_top_k=top_k_num,
-        )
+        if native_plan["gemm2"]:
+            native_module.launch(
+                qintermediate_cache2,
+                w2,
+                gemm2_output,
+                curr_topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                1,
+                native_plan["gemm2_grid"],
+            )
+        else:
+            dispatch_fused_moe_kernel(
+                qintermediate_cache2,
+                w2,
+                gemm2_output,
+                a2q_scale,
+                w2_scale,
+                w2_zp,
+                curr_topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                not apply_router_weight_on_input and not defer_router_weight_for_sum,
+                1,
+                gemm2_config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                per_channel_quant=per_channel_quant,
+                block_shape=block_shape,
+                B_bias=w2_bias,
+                FUSE_SILU=False,
+                direct_sum=use_direct_sum,
+                out_top_k=top_k_num,
+            )
 
         # 8. Reduce GEMM2 top-k outputs unless direct_sum wrote final output directly
         if not use_direct_sum:
             moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.size()),
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
-                curr_topk_weights if defer_router_weight else None,
+                curr_topk_weights if defer_router_weight_for_sum else None,
             )
 
     return out_hidden_states

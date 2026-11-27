@@ -20,6 +20,13 @@ import pytest
 import torch
 import yaml
 
+# Match tests/conftest.py: MetaX requires vLLM's fused_moe module to be
+# initialized before flaggems_vllm to avoid duplicate mcoplib registration.
+if torch.cuda.is_available() and "MetaX" in torch.cuda.get_device_name(0):
+    from vllm.model_executor.layers.fused_moe.fused_moe import (  # noqa: F401
+        fused_experts_impl as _metax_fused_experts_impl,
+    )
+
 import flaggems_vllm
 from flaggems_vllm.runtime import torch_device_fn
 

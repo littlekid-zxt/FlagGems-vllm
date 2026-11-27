@@ -20,9 +20,15 @@ from datetime import datetime
 
 import pytest
 
-# TODO(Qiming): Try remove this line
-# import torch  # noqa: F401
+import torch
 import yaml
+
+# MetaX's mcoplib operator registration depends on vLLM being initialized
+# before flaggems_vllm. Keep ordinary pytest invocation safe on that backend.
+if torch.cuda.is_available() and "MetaX" in torch.cuda.get_device_name(0):
+    from vllm.model_executor.layers.fused_moe.fused_moe import (  # noqa: F401
+        fused_experts_impl as _metax_fused_experts_impl,
+    )
 
 import flaggems_vllm
 

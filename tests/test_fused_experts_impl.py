@@ -341,6 +341,38 @@ def test_fused_moe_vs_vllm(config, dtype):
 
 
 @pytest.mark.fused_experts_impl
+@pytest.mark.parametrize("num_tokens", (4108, 4435))
+@pytest.mark.skipif(vendor_name != "metax", reason="MetaX FP16 overflow regression")
+def test_fused_moe_fp16_router_weight_overflow(num_tokens):
+    num_experts, hidden_size, intermediate_size, topk = 256, 2048, 128, 8
+    device = flaggems_vllm.device
+    dtype = torch.float16
+    torch.manual_seed(0)
+    hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+    w1 = torch.randn(
+        num_experts,
+        intermediate_size * 2,
+        hidden_size,
+        device=device,
+        dtype=dtype,
+    )
+    w2 = torch.randn(
+        num_experts, hidden_size, intermediate_size, device=device, dtype=dtype
+    )
+    gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+    topk_weights, topk_ids = make_topk_routing(gating, topk, dtype)
+
+    result = fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids)
+    ref = _vllm_moe_reference(hidden_states, w1, w2, topk_weights, topk_ids)
+    torch_device_fn.synchronize()
+
+    assert torch.isfinite(result).all()
+    assert torch.isfinite(ref).all()
+    rel_l2 = (result.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12)
+    assert rel_l2 < 1e-2, f"relative L2 error is too large: {rel_l2}"
+
+
+@pytest.mark.fused_experts_impl
 @pytest.mark.parametrize("config", FUSED_MOE_QUANT_CONFIGS)
 @pytest.mark.skipif(
     not FP8_AVAILABLE,
